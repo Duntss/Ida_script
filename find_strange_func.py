@@ -33,7 +33,18 @@ def Find_suspicious():
                     idc.set_color(x,CIC_FUNC,0xB1C813)
                     print(hex(x) + " " + idc.generate_disasm_line(x,0))
                     bp.append(x)
-                    
+                
+                #CALL [REG]
+                elif idc.get_operand_type(x,0) == o_phrase:
+                    brackets = idc.print_operand(x,0)
+                    brackets = brackets[brackets.index('[')+1 : brackets.index(']')]
+                    if "+" not in brackets:
+                        idc.set_color(x, CIC_ITEM,0xA1A600)
+                        idc.set_color(x,CIC_FUNC,0xB1C813)
+                        print(hex(x) + " " + idc.generate_disasm_line(x,0))
+                        bp.append(x)
+                        
+                
             elif idc.print_insn_mnem(x) == "jmp":
                 # JMP as memory ref
                 if idc.get_operand_type(x, 0) == o_mem:
@@ -50,7 +61,17 @@ def Find_suspicious():
                     idc.set_color(x,CIC_ITEM,0xA1A600) 
                     idc.set_color(x,CIC_FUNC,0xB1C813)
                     print(hex(x) + " " + idc.generate_disasm_line(x,0)) 
-                    bp.append(x) 
+                    bp.append(x)
+                    
+                #JMP [REG]
+                elif idc.get_operand_type(x,0) == o_phrase:
+                    brackets = idc.print_operand(x,0)
+                    brackets = brackets[brackets.index('[')+1 : brackets.index(']')]
+                    if "+" not in brackets:
+                        idc.set_color(x, CIC_ITEM,0xA1A600)
+                        idc.set_color(x,CIC_FUNC,0xB1C813)
+                        print(hex(x) + " " + idc.generate_disasm_line(x,0))
+                        bp.append(x)
                     
             elif idc.print_insn_mnem(x) == "cpuid":
                     idc.set_color(x,CIC_ITEM,0xA1A600) 
