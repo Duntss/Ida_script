@@ -1,3 +1,5 @@
+# Usefull for detecting EOP in packed PE. Give an output for xdbg
+
 import idaapi
 import idc
 import idautils
@@ -7,14 +9,14 @@ bp = []
 def Find_suspicious():
     msg("=== Suspicious CALLs to dword_* ===\n")
     for function in idautils.Functions():
-        # Ignorer les fonctions de bibliothèque ou thunk
+        
         flags = get_func_attr(function, FUNCATTR_FLAGS)
         if flags & FUNC_LIB or flags & FUNC_THUNK:
             continue
 
-        # Parcourir toutes les instructions de la fonction
+        
         for x in idautils.FuncItems(function):
-            # Filtrer uniquement les appels
+            
             if idc.print_insn_mnem(x) == "call":
             
                 # CALL as memory ref
@@ -92,17 +94,16 @@ def FindUnknownFunctions():
     start = seg.start_ea
     BAD = idaapi.BADADDR
 
-    # Passe 1 : on crée la fonction dès qu'on trouve un trou
+    # First method
     ea = idaapi.find_not_func(start, idaapi.SEARCH_DOWN)
     while ea != BAD:
         idaapi.add_func(ea)
         ea = idaapi.find_not_func(ea + 1, idaapi.SEARCH_DOWN)
 
     print("Looking for unknown functions – passe 2")
-    # Passe 2 : on redéfinit la fin de chaque fonction
+    # Second method define each functions end
     ea = idaapi.find_not_func(start, idaapi.SEARCH_DOWN)
     while ea != BAD:
-        # cherche la prochaine donnée ou la fin de section
         end_ea = idaapi.find_data(ea, idaapi.SEARCH_DOWN)
         if end_ea == BAD or end_ea > seg.end_ea:
             end_ea = seg.end_ea
