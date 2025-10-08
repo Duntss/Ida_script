@@ -3,219 +3,282 @@ import idc
 import idautils
 import re
 
-def find_all_esp_references(func):
+def extract_stack_offsets_from_pseudocode(func_ea):
     """
-    Trouve TOUTES les instructions qui référencent [esp+offset]
+    Extract every STACK offset from pseudo-code 
     """
-    esp_instructions = []
+    stack_offsets = {} 
     
-    for head in idautils.Heads(func.start_ea, func.end_ea):
-        disasm = idc.GetDisasm(head)
-        
-        # Chercher [esp+offset] ou [esp-offset]
-        match = re.search(r'\[esp[\+\-]([0-9A-Fa-f]+)h?\]', disasm, re.IGNORECASE)
-        if match:
-            offset_str = match.group(1)
-            offset = int(offset_str, 16)
-            
-            # Déterminer si c'est + ou -
-            if '-' in match.group(0):
-                offset = -offset
-            
-            mnem = idc.print_insn_mnem(head)
-            esp_instructions.append((head, offset, mnem, disasm))
-    
-    return esp_instructions
-
-def analyze_and_fix_all_esp_references(func_ea, dry_run=False):
-    """
-    Corrige TOUTES les références à [esp+offset], pas seulement LEA
-    """
-    print(f"\n{'[DRY RUN] ' if dry_run else ''}[*] Analyse COMPLÈTE de la fonction à 0x{func_ea:X}")
-    
-    func = idaapi.get_func(func_ea)
-    if not func:
-        print(f"[!] Pas de fonction trouvée")
-        return 0
-    
-    frame_size = idc.get_func_attr(func_ea, idc.FUNCATTR_FRSIZE)
-    print(f"[*] Taille frame: 0x{frame_size:X} ({frame_size} bytes)")
-    
-    # Obtenir tous les offsets STACK du pseudo-code
-    stack_offsets = set()
     try:
         cfunc = idaapi.decompile(func_ea)
         text = str(cfunc)
-        pattern = r'STACK\[0x([0-9A-Fa-f]+)\]'
-        for match in re.finditer(pattern, text):
-            stack_offsets.add(int(match.group(1), 16))
-        print(f"[*] Offsets STACK trouvés: {sorted(stack_offsets)}")
+        
+        # Extract STACK[0x...]
+        for match in re.finditer(r'STACK\[0x([0-9A-Fa-f]+)\]', text):
+            offset = int(match.group(1), 16)
+            stack_offsets[offset] = stack_offsets.get(offset, 0) + 1
+
+        # Extract from lvars
+        lvars = cfunc.get_lvars()
+        for lvar in lvars:
+            if lvar.is_stk_var():
+                offset = lvar.get_stkoff()
+                if offset >= 0:
+                    stack_offsets[offset] = stack_offsets.get(offset, 0) + 1
+        
     except Exception as e:
-        print(f"[!] Erreur analyse pseudo-code: {e}")
+        print(f"  [!] Error: {e}")
+    
+    return stack_offsets
+
+def find_esp_instruction_at_address(ea):
+    """
+    Extract offset ESP of a given instruction
+    """
+    try:
+        disasm = idc.GetDisasm(ea).lower()
+        
+        # Method 1 : Via API
+        for i in range(idaapi.UA_MAXOP):
+            op_type = idc.get_operand_type(ea, i)
+            if op_type in [idc.o_displ, idc.o_phrase]:
+                op_str = idc.print_operand(ea, i).lower()
+                if 'esp' in op_str or 'rsp' in op_str:
+                    offset = idc.get_operand_value(ea, i)
+                    # Normalize negative offsets
+                    if offset > 0x7FFFFFFF:
+                        offset = offset - 0x100000000
+                    return offset
+
+        # Method 2: Regex on disasm
+        match = re.search(r'\[esp[\+\-]([0-9A-Fa-f]+)h?\]', disasm, re.IGNORECASE)
+        if match:
+            offset = int(match.group(1), 16)
+            if '-' in match.group(0):
+                offset = -offset
+            return offset
+            
+    except:
+        pass
+    
+    return None
+
+def force_align_stack_offsets(func_ea, dry_run=True):
+    """
+    Force alignment between assembler and pseudo-code
+
+    1. Find all STACK[X] from pseudo-code
+    2. For each [esp+Y] from assembler, find the closest STACK[X]
+    3. Force SP delta so that esp+Y points to STACK[X]
+    """
+    print(f"\n{'[DRY RUN] ' if dry_run else ''}[*] FORCE ALIGNMENT - Function 0x{func_ea:X}")
+
+    func = idaapi.get_func(func_ea)
+    if not func:
+        print("[!] No function")
         return 0
+    
+    func_name = idc.get_func_name(func_ea)
+    frame_size = idc.get_func_attr(func_ea, idc.FUNCATTR_FRSIZE)
+    
+    print(f"[*] Function: {func_name}")
+    print(f"[*] Frame size: 0x{frame_size:X} ({frame_size} bytes)\n")
+
+    # 1. Extract STACK offsets from pseudo-code
+    stack_offsets = extract_stack_offsets_from_pseudocode(func_ea)
     
     if not stack_offsets:
-        print("[!] Aucun offset STACK trouvé")
+        print("[!] No STACK offset found in pseudo-code")
         return 0
     
-    # Trouver TOUTES les instructions [esp+offset]
-    esp_instructions = find_all_esp_references(func)
-    if not esp_instructions:
-        print("[*] Aucune référence [esp+offset] trouvée")
+    sorted_offsets = sorted(stack_offsets.keys())
+    print(f"[*] {len(sorted_offsets)} unique STACK offset(s):")
+
+    # Show most frequent offsets
+    frequent = sorted(stack_offsets.items(), key=lambda x: x[1], reverse=True)[:10]
+    for offset, count in frequent:
+        print(f"    STACK[0x{offset:X}] ({offset}) - {count}x")
+    print()
+
+    # 2. Scan all [esp+X] instructions
+    alignments = []  # List of (ea, esp_offset, target_stack_offset, new_sp)
+
+    for head in idautils.Heads(func.start_ea, func.end_ea):
+        esp_offset = find_esp_instruction_at_address(head)
+        if esp_offset is None:
+            continue
+        
+        disasm = idc.GetDisasm(head)
+        mnem = idc.print_insn_mnem(head)
+        current_sp = idc.get_spd(head)
+
+        # Find closest STACK offset
+        best_stack_offset = min(sorted_offsets, key=lambda x: abs(x - (esp_offset - current_sp)))
+
+        # Calculate new SP needed
+        new_sp = esp_offset - best_stack_offset
+
+        # Check if a change is needed
+        current_result = esp_offset - current_sp
+
+        # Always force alignment if a corresponding STACK is found
+        # even if the current result seems "correct"
+        if abs(new_sp - current_sp) > 2:  # Tolerance of 2 bytes
+            alignments.append({
+                'ea': head,
+                'esp_offset': esp_offset,
+                'current_sp': current_sp,
+                'current_result': current_result,
+                'target_stack': best_stack_offset,
+                'new_sp': new_sp,
+                'mnem': mnem,
+                'disasm': disasm
+            })
+    
+    if not alignments:
+        print("[+] All ESP offsets are already aligned!")
         return 0
+
+    # 3. Show alignments to be made
+    print(f"[*] {len(alignments)} alignment(s) to be made:\n")
+
+    for a in alignments[:10]:
+        print(f"0x{a['ea']:X}: {a['disasm']}")
+        print(f"  [esp+0x{a['esp_offset']:X}] (esp_offset={a['esp_offset']})")
+        print(f"  Current: SP={a['current_sp']:5d} -> offset {a['current_result']:5d}")
+        print(f"  Target:  STACK[0x{a['target_stack']:X}] ({a['target_stack']})")
+        print(f"  New SP:  {a['new_sp']:5d} -> STACK[0x{a['target_stack']:X}] ✓")
+        print()
     
-    print(f"[*] {len(esp_instructions)} instructions avec [esp+offset] trouvées")
-    
-    # Grouper les corrections par adresse pour éviter les doublons
-    fixes_by_address = {}
-    errors_found = 0
-    
-    for ea, esp_offset, mnem, disasm in esp_instructions:
-        current_sp = idc.get_spd(ea)
-        current_stack_offset = esp_offset - current_sp
+    if len(alignments) > 10:
+        print(f"  ... and {len(alignments) - 10} more\n")
+
+    # 4. Apply fixes
+    if not dry_run:
+        print(f"[*] Applying {len(alignments)} alignment(s)...\n")
+        applied = 0
         
-        # Vérifier si c'est une erreur
-        is_error = current_stack_offset < 0 or current_stack_offset > frame_size * 3
-        
-        if is_error:
-            errors_found += 1
-            
-            # Trouver le meilleur offset STACK correspondant
-            best_target = None
-            best_diff = float('inf')
-            
-            for stack_offset in stack_offsets:
-                needed_sp = esp_offset - stack_offset
-                diff = abs(needed_sp - current_sp)
-                
-                if abs(needed_sp) < frame_size * 2 and diff < best_diff:
-                    best_diff = diff
-                    best_target = (stack_offset, needed_sp)
-            
-            if best_target and ea not in fixes_by_address:
-                target_offset, new_sp = best_target
-                fixes_by_address[ea] = (new_sp, esp_offset, current_sp, current_stack_offset, target_offset, mnem, disasm)
-    
-    # Afficher les corrections nécessaires
-    if errors_found > 0:
-        print(f"\n[!] {errors_found} erreur(s) détectée(s)")
-        print(f"[*] {len(fixes_by_address)} correction(s) unique(s) à appliquer:\n")
-        
-        for ea in sorted(fixes_by_address.keys()):
-            new_sp, esp_off, curr_sp, curr_stack, target, mnem, disasm = fixes_by_address[ea]
-            print(f"0x{ea:X}: {mnem:8s} [esp+0x{esp_off:X}]")
-            print(f"  Current: SP={curr_sp:5d} -> STACK[{curr_stack:5d}] ❌")
-            print(f"  New:     SP={new_sp:5d} -> STACK[0x{target:X}] ✓")
-            print()
-    
-    # Appliquer les corrections
-    fixes_applied = 0
-    if not dry_run and fixes_by_address:
-        print(f"[*] Application de {len(fixes_by_address)} correction(s)...\n")
-        
-        for ea, (new_sp, _, _, _, _, _, _) in fixes_by_address.items():
+        for a in alignments:
             try:
-                idc.add_user_stkpnt(ea, new_sp)
-                fixes_applied += 1
-                print(f"  [+] 0x{ea:X}: SP delta -> {new_sp}")
+                idc.add_user_stkpnt(a['ea'], a['new_sp'])
+                applied += 1
+                if applied <= 10:  # Afficher les 10 premiers
+                    print(f"  [+] 0x{a['ea']:X}: SP {a['current_sp']} -> {a['new_sp']}")
             except Exception as e:
-                print(f"  [!] 0x{ea:X}: Erreur: {e}")
+                print(f"  [!] 0x{a['ea']:X}: Error: {e}")
         
-        if fixes_applied > 0:
-            print("\n[*] Recompilation du pseudo-code...")
+        if applied > 10:
+            print(f"  [+] ... and {applied - 10} more")
+
+        print(f"\n[+] {applied}/{len(alignments)} alignment(s) applied")
+        
+        if applied > 0:
+            print("\n[*] Recompilation...")
             try:
                 idaapi.decompile(func_ea)
-                print("[+] Recompilation OK!")
+                print("[+] OK!")
                 print("\n" + "="*60)
-                print("IMPORTANT: Fermez et rouvrez la fenêtre Hex-Rays")
-                print("pour voir les changements dans le pseudo-code!")
+                print("F5 to refresh IDA or close and reopen")
                 print("="*60)
             except Exception as e:
-                print(f"[!] Erreur recompilation: {e}")
-    
-    elif dry_run and fixes_by_address:
-        print(f"\n[DRY RUN] {len(fixes_by_address)} correction(s) seraient appliquées")
-    
-    elif errors_found == 0:
-        print("\n[+] Aucune erreur détectée - fonction déjà correcte!")
-    
-    return fixes_applied
+                print(f"[!] Error: {e}")
+        
+        return applied
+    else:
+        print(f"\n[DRY RUN] {len(alignments)} alignment(s) would be applied")
+        return 0
 
-def fix_current_function_complete(dry_run=True):
+def manual_fix_instruction(ea, target_stack_offset):
     """
-    Correction COMPLÈTE (LEA, MOV, CMP, etc.)
+    Manually fix a specific instruction
+    Usage: manual_fix_instruction(0x4160A7, 0xC74)
+    """
+    esp_offset = find_esp_instruction_at_address(ea)
+    if esp_offset is None:
+        print(f"[!] No [esp+X] instruction found at 0x{ea:X}")
+        return False
+    
+    new_sp = esp_offset - target_stack_offset
+    current_sp = idc.get_spd(ea)
+    
+    print(f"[*] Instruction: {idc.GetDisasm(ea)}")
+    print(f"[*] ESP offset: 0x{esp_offset:X} ({esp_offset})")
+    print(f"[*] Current SP: {current_sp} -> offset {esp_offset - current_sp}")
+    print(f"[*] Target: STACK[0x{target_stack_offset:X}] ({target_stack_offset})")
+    print(f"[*] New SP: {new_sp}")
+    
+    try:
+        idc.add_user_stkpnt(ea, new_sp)
+        print(f"[+] SP delta applied!")
+
+        func_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
+        idaapi.decompile(func_ea)
+        print("[+] Recompiled - Close and reopen IDA or press F5")
+        return True
+    except Exception as e:
+        print(f"[!] Error: {e}")
+        return False
+
+def show_instruction_info(ea=None):
+    """
+    Show all info about an instruction
+    If ea=None, use the current address
+    """
+    if ea is None:
+        ea = idc.here()
+    
+    func_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
+    if func_ea == idc.BADADDR:
+        print("[!] No function")
+        return
+
+    print(f"\n[*] Analyzing 0x{ea:X}")
+    print(f"[*] Disasm: {idc.GetDisasm(ea)}")
+    
+    esp_offset = find_esp_instruction_at_address(ea)
+    if esp_offset is None:
+        print("[!] No [esp+X] instruction found")
+        return
+    
+    current_sp = idc.get_spd(ea)
+    result = esp_offset - current_sp
+    
+    print(f"\n[*] ESP offset: 0x{esp_offset:X} ({esp_offset})")
+    print(f"[*] SP delta: {current_sp}")
+    print(f"[*] Result: {result} (0x{result:X} is positive)")
+
+    # Find corresponding STACK
+    stack_offsets = extract_stack_offsets_from_pseudocode(func_ea)
+    if stack_offsets:
+        sorted_offsets = sorted(stack_offsets.keys())
+        closest = min(sorted_offsets, key=lambda x: abs(x - result))
+        print(f"\n[*] Closest STACK: 0x{closest:X} ({closest})")
+        print(f"[*] Difference: {abs(result - closest)} bytes")
+        
+        if abs(result - closest) > 4:
+            new_sp = esp_offset - closest
+            print(f"\n[!] SUGGESTED CORRECTION:")
+            print(f"    manual_fix_instruction(0x{ea:X}, 0x{closest:X})")
+            print(f"    New SP: {new_sp}")
+
+def fix_current_function(dry_run=True):
+    """
+    Correct the function with the new algorithm
     """
     ea = idc.here()
     func_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
     
     if func_ea == idc.BADADDR:
-        print("[!] Aucune fonction trouvée")
+        print("[!] No function")
         return
     
-    fixes = analyze_and_fix_all_esp_references(func_ea, dry_run)
-    
-    if not dry_run and fixes > 0:
-        print(f"\n[+] {fixes} correction(s) appliquée(s) avec succès!")
-
-def fix_all_functions_batch(dry_run=True):
-    """
-    Corrige toutes les fonctions du programme
-    """
-    print("="*60)
-    print(f"{'[DRY RUN] ' if dry_run else ''}CORRECTION EN MASSE")
-    print("="*60)
-    
-    total_functions = idc.get_func_qty()
-    functions_with_errors = 0
-    total_fixes = 0
-    
-    print(f"\n[*] Analyse de {total_functions} fonction(s)...\n")
-    
-    for i, func_ea in enumerate(idautils.Functions()):
-        try:
-            func = idaapi.get_func(func_ea)
-            if not func:
-                continue
-            
-            # Analyse rapide pour détecter les erreurs
-            esp_refs = find_all_esp_references(func)
-            if not esp_refs:
-                continue
-            
-            frame_size = idc.get_func_attr(func_ea, idc.FUNCATTR_FRSIZE)
-            errors = 0
-            
-            for ea, esp_offset, mnem, disasm in esp_refs:
-                current_sp = idc.get_spd(ea)
-                current_stack_offset = esp_offset - current_sp
-                
-                if current_stack_offset < 0 or current_stack_offset > frame_size * 3:
-                    errors += 1
-            
-            if errors > 0:
-                functions_with_errors += 1
-                func_name = idc.get_func_name(func_ea)
-                print(f"[{i+1}/{total_functions}] 0x{func_ea:X} {func_name}: {errors} erreur(s)")
-                
-                if not dry_run:
-                    fixes = analyze_and_fix_all_esp_references(func_ea, dry_run=False)
-                    total_fixes += fixes
-                    
-        except Exception as e:
-            print(f"[!] Erreur 0x{func_ea:X}: {e}")
-    
-    print("\n" + "="*60)
-    print(f"Fonctions analysées: {total_functions}")
-    print(f"Fonctions avec erreurs: {functions_with_errors}")
-    if not dry_run:
-        print(f"Total corrections: {total_fixes}")
-    print("="*60)
+    return force_align_stack_offsets(func_ea, dry_run)
 
 def undo_all_sp_changes():
     """
-    Annule toutes les modifications SP
+    Remove every modification made by this script
     """
-    print("[*] Suppression de tous les points SP personnalisés...")
+    print("[*] Removing all custom SP deltas...")
     count = 0
     
     for func_ea in idautils.Functions():
@@ -230,21 +293,22 @@ def undo_all_sp_changes():
             except:
                 pass
     
-    print(f"[+] {count} point(s) SP supprimé(s)")
-    print("[*] Redémarrez l'analyse IDA pour restaurer complètement")
+    print(f"[+] {count} custom SP delta(s) removed")
 
 if __name__ == "__main__":
     print("="*60)
-    print("Script de correction COMPLÈTE des SP deltas")
+    print("IDA SP Delta Fixer - FORCE ALIGNMENT v4")
     print("="*60)
-    print("\nCe script corrige TOUTES les instructions [esp+offset]:")
-    print("  - LEA, MOV, CMP, PUSH, ADD, SUB, etc.")
-    print("  - Détecte les offsets négatifs (erreur IDA)")
-    print("  - Propose la meilleure correction")
-    print("\nCommandes:")
-    print("  fix_current_function_complete()        - Analyser (DRY RUN)")
-    print("  fix_current_function_complete(False)   - CORRIGER")
-    print("  fix_all_functions_batch()              - Tout analyser")
-    print("  fix_all_functions_batch(False)         - TOUT CORRIGER")
-    print("  undo_all_sp_changes()                  - Annuler")
+    print("\nNew approach:")
+    print("  - Force alignment between [esp+X] and STACK[Y]")
+    print("  - No longer searches for errors, ENFORCES consistency")
+    print("  - More tolerant and aggressive")
+    print("\nMain commands:")
+    print("  fix_current_function()           - Analyze (DRY RUN)")
+    print("  fix_current_function(False)      - FIX")
+    print("\nAdvanced commands:")
+    print("  show_instruction_info()          - Show current instruction info")
+    print("  show_instruction_info(0xADDR)    - Show specific instruction info")
+    print("  manual_fix_instruction(ea, off)  - Manual correction")
+    print("  undo_all_sp_changes()            - Undo all changes")
     print("="*60)
